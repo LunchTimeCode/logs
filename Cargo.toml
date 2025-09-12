@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.28"
-egui = "0.28"
+egui = "0.32"
 egui_logger = "0.6"
 xshell = "0.2"
 serde = { version = "1.0", features = ["derive"] }
