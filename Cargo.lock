@@ -1949,6 +1949,7 @@ dependencies = [
  "eframe",
  "egui 0.28.1",
  "egui_logger",
+ "regex",
  "serde",
  "serde_json",
 ]

@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::fs;
 use std::path::PathBuf;
 use chrono::{NaiveDateTime, NaiveDate, NaiveTime, Duration, Local, Datelike};
+use regex::Regex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FavoriteCommand {
@@ -309,6 +310,67 @@ impl LogsApp {
         None
     }
 
+    fn extract_timestamp_from_log(content: &str) -> (Option<String>, String) {
+        // Common timestamp patterns in logs
+        let patterns = [
+            // ISO 8601 with milliseconds: "2025-09-15T14:30:00.123Z"
+            (r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z?)", "%Y-%m-%dT%H:%M:%S%.3fZ"),
+            // Standard datetime: "2025-09-15 14:30:00.123"
+            (r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d{3})?)", "%Y-%m-%d %H:%M:%S%.3f"),
+            // Standard datetime without milliseconds: "2025-09-15 14:30:00"
+            (r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", "%Y-%m-%d %H:%M:%S"),
+            // Syslog format: "Sep 15 14:30:00" or "Sep  5 14:30:00"
+            (r"([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})", "%b %d %H:%M:%S"),
+            // Time only with milliseconds: "14:30:00.123"
+            (r"(\d{2}:\d{2}:\d{2}\.\d{3})", "%H:%M:%S%.3f"),
+            // Time only: "14:30:00"
+            (r"(\d{2}:\d{2}:\d{2})", "%H:%M:%S"),
+            // Date with slashes: "09/15/2025 14:30:00"
+            (r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})", "%m/%d/%Y %H:%M:%S"),
+            // Unix timestamp (10 digits): "1726401000"
+            (r"(\d{10})", "unix"),
+        ];
+
+        for (pattern, format) in &patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                if let Some(captures) = re.captures(content) {
+                    if let Some(timestamp_match) = captures.get(1) {
+                        let timestamp_str = timestamp_match.as_str();
+                        
+                        // Parse the timestamp
+                        let parsed_timestamp = if *format == "unix" {
+                            // Handle Unix timestamp
+                            if let Ok(unix_ts) = timestamp_str.parse::<i64>() {
+                                chrono::DateTime::from_timestamp(unix_ts, 0)
+                                    .map(|dt| dt.naive_local())
+                            } else {
+                                None
+                            }
+                        } else if format.contains("%b") {
+                            // Handle syslog format - need to add current year
+                            let current_year = Local::now().year();
+                            let with_year = format!("{current_year} {timestamp_str}");
+                            NaiveDateTime::parse_from_str(&with_year, &format!("%Y {format}")).ok()
+                        } else {
+                            // Handle other formats
+                            NaiveDateTime::parse_from_str(timestamp_str, format).ok()
+                        };
+
+                        if let Some(dt) = parsed_timestamp {
+                            let formatted_timestamp = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+                            // Remove the timestamp from content to avoid duplication
+                            let cleaned_content = content.replace(timestamp_str, "").trim().to_string();
+                            return (Some(formatted_timestamp), cleaned_content);
+                        }
+                    }
+                }
+            }
+        }
+
+        // No timestamp found, return original content
+        (None, content.to_string())
+    }
+
     fn start_log_collection(&mut self) {
         if self.log_thread_handle.is_some() {
             return;
@@ -371,8 +433,16 @@ impl LogsApp {
     }
 
     fn add_log_entry(&mut self, content: String) {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        self.logs.push(LogEntry { timestamp, content });
+        let (extracted_timestamp, cleaned_content) = Self::extract_timestamp_from_log(&content);
+        
+        let timestamp = extracted_timestamp.unwrap_or_else(|| {
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        });
+        
+        self.logs.push(LogEntry { 
+            timestamp, 
+            content: cleaned_content 
+        });
 
         if self.logs.len() > 10000 {
             self.logs.drain(0..1000);
@@ -728,13 +798,31 @@ impl eframe::App for LogsApp {
                 .auto_shrink([false, false])
                 .stick_to_bottom(self.auto_scroll)
                 .show(ui, |ui| {
-                    egui::Grid::new("log_grid").striped(true).show(ui, |ui| {
-                        for log_entry in filtered_logs {
-                            ui.label(&log_entry.timestamp);
-                            ui.label(&log_entry.content);
+                    egui::Grid::new("log_grid")
+                        .striped(true)
+                        .spacing([10.0, 4.0])
+                        .show(ui, |ui| {
+                            // Table headers
+                            ui.strong("Timestamp");
+                            ui.strong("Log Content");
                             ui.end_row();
-                        }
-                    });
+                            
+                            // Add separator line
+                            ui.separator();
+                            ui.separator();
+                            ui.end_row();
+                            
+                            // Log entries
+                            for log_entry in filtered_logs {
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                    ui.add_sized([180.0, ui.available_height()], egui::Label::new(&log_entry.timestamp));
+                                });
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                    ui.label(&log_entry.content);
+                                });
+                                ui.end_row();
+                            }
+                        });
                 });
         });
     }
