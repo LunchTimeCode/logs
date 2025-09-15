@@ -1,13 +1,21 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::thread;
-use xshell::{Shell, cmd};
+use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
     log_command: String,
     refresh_interval: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum FilterMode {
+    IncludeSelected,
+    ExcludeSelected,
 }
 
 impl Default for Settings {
@@ -27,27 +35,43 @@ struct LogEntry {
 struct LogsApp {
     settings: Settings,
     logs: Vec<LogEntry>,
-    filter_text: String,
+    selected_log_levels: HashSet<String>,
+    filter_mode: FilterMode,
     search_text: String,
     auto_scroll: bool,
     show_settings: bool,
     log_receiver: Option<mpsc::Receiver<String>>,
     log_thread_handle: Option<thread::JoinHandle<()>>,
     settings_changed: bool,
+    current_level_filter: String,
 }
 
 impl Default for LogsApp {
     fn default() -> Self {
+        let mut selected_log_levels = HashSet::new();
+        selected_log_levels.insert("trace".to_string());
+        selected_log_levels.insert("debug".to_string());
+        selected_log_levels.insert("info".to_string());
+        selected_log_levels.insert("warn".to_string());
+        selected_log_levels.insert("warning".to_string());
+        selected_log_levels.insert("error".to_string());
+        selected_log_levels.insert("err".to_string());
+        selected_log_levels.insert("fatal".to_string());
+        selected_log_levels.insert("critical".to_string());
+        selected_log_levels.insert("crit".to_string());
+        
         Self {
             settings: Settings::default(),
             logs: Vec::new(),
-            filter_text: String::new(),
+            selected_log_levels,
+            filter_mode: FilterMode::IncludeSelected,
             search_text: String::new(),
             auto_scroll: true,
             show_settings: false,
             log_receiver: None,
             log_thread_handle: None,
             settings_changed: false,
+            current_level_filter: "All Levels".to_string(),
         }
     }
 }
@@ -64,8 +88,6 @@ impl LogsApp {
         let command = self.settings.log_command.clone();
 
         let handle = thread::spawn(move || {
-            let sh = Shell::new().unwrap();
-
             let parts: Vec<&str> = command.split_whitespace().collect();
             if parts.is_empty() {
                 return;
@@ -74,22 +96,28 @@ impl LogsApp {
             let program = parts[0];
             let args = &parts[1..];
 
-            let result = if args.is_empty() {
-                cmd!(sh, "{program}").read()
-            } else {
-                let mut cmd_builder = cmd!(sh, "{program}");
-                for arg in args {
-                    cmd_builder = cmd_builder.arg(arg);
-                }
-                cmd_builder.read()
-            };
+            let mut cmd = Command::new(program);
+            cmd.args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
 
-            if let Ok(output) = result {
-                for line in output.lines() {
-                    if tx.send(line.to_string()).is_err() {
-                        break;
+            if let Ok(mut child) = cmd.spawn() {
+                if let Some(stdout) = child.stdout.take() {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(line_content) => {
+                                if tx.send(line_content).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
+                
+                // Clean up the child process
+                let _ = child.wait();
             }
         });
 
@@ -123,13 +151,19 @@ impl LogsApp {
         self.logs
             .iter()
             .filter(|entry| {
-                let matches_filter = if self.filter_text.is_empty() {
+                let matches_filter = if self.selected_log_levels.is_empty() {
                     true
                 } else {
-                    entry
-                        .content
-                        .to_lowercase()
-                        .contains(&self.filter_text.to_lowercase())
+                    let content_lower = entry.content.to_lowercase();
+                    
+                    let contains_selected_level = self.selected_log_levels.iter().any(|level| {
+                        content_lower.contains(&level.to_lowercase())
+                    });
+                    
+                    match self.filter_mode {
+                        FilterMode::IncludeSelected => contains_selected_level,
+                        FilterMode::ExcludeSelected => !contains_selected_level,
+                    }
                 };
 
                 let matches_search = if self.search_text.is_empty() {
@@ -184,8 +218,48 @@ impl eframe::App for LogsApp {
 
                 ui.separator();
 
-                ui.label("Filter:");
-                ui.text_edit_singleline(&mut self.filter_text);
+                ui.label("Command:");
+                ui.add(egui::TextEdit::singleline(&mut self.settings.log_command).desired_width(200.0));
+                if ui.button("Apply").clicked() {
+                    self.restart_log_collection();
+                }
+
+                ui.separator();
+
+                ui.label("Log Level Filter:");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("Level")
+                        .selected_text(&self.current_level_filter)
+                        .show_ui(ui, |ui| {
+                            let levels = [
+                                ("All Levels", "All Levels"),
+                                ("TRACE", "trace"),
+                                ("DEBUG", "debug"), 
+                                ("INFO", "info"),
+                                ("WARN", "warn"),
+                                ("WARNING", "warning"),
+                                ("ERROR", "error"),
+                                ("ERR", "err"),
+                                ("FATAL", "fatal"),
+                                ("CRITICAL", "critical"),
+                                ("CRIT", "crit"),
+                            ];
+                            
+                            for (display_name, level_key) in levels {
+                                if ui.selectable_value(&mut self.current_level_filter, display_name.to_string(), display_name).clicked() {
+                                    self.selected_log_levels.clear();
+                                    if level_key != "All Levels" {
+                                        self.selected_log_levels.insert(level_key.to_string());
+                                    }
+                                }
+                            }
+                        });
+                    
+                    ui.separator();
+                    ui.label("Mode:");
+                    ui.radio_value(&mut self.filter_mode, FilterMode::IncludeSelected, "Include");
+                    ui.radio_value(&mut self.filter_mode, FilterMode::ExcludeSelected, "Exclude");
+                });
 
                 ui.separator();
 
@@ -210,14 +284,6 @@ impl eframe::App for LogsApp {
             egui::Window::new("Settings")
                 .open(&mut show_settings)
                 .show(ctx, |ui| {
-                    ui.label("Log Command:");
-                    if ui
-                        .text_edit_singleline(&mut self.settings.log_command)
-                        .changed()
-                    {
-                        self.settings_changed = true;
-                    }
-
                     ui.label("Refresh Interval (ms):");
                     if ui
                         .add(egui::Slider::new(
@@ -238,13 +304,6 @@ impl eframe::App for LogsApp {
                             reset_settings = true;
                         }
                     });
-
-                    ui.separator();
-                    ui.label("Examples:");
-                    ui.label("• journalctl -f");
-                    ui.label("• tail -f /var/log/syslog");
-                    ui.label("• docker logs -f container_name");
-                    ui.label("• kubectl logs -f pod_name");
                 });
         }
 
