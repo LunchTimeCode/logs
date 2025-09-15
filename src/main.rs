@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 use std::fs;
 use std::path::PathBuf;
+use chrono::{NaiveDateTime, NaiveDate, NaiveTime, Duration, Local, Datelike};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FavoriteCommand {
@@ -25,6 +26,79 @@ struct Settings {
 enum FilterMode {
     IncludeSelected,
     ExcludeSelected,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TimeSpanMode {
+    Disabled,
+    Predefined(PredefinedSpan),
+    Custom,
+    Relative,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PredefinedSpan {
+    Last15Minutes,
+    Last30Minutes,
+    Last1Hour,
+    Last6Hours,
+    Last24Hours,
+    Last3Days,
+    Last1Week,
+    Last1Month,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TimeUnit {
+    Minutes,
+    Hours,
+    Days,
+}
+
+impl PredefinedSpan {
+    fn display_name(&self) -> &'static str {
+        match self {
+            PredefinedSpan::Last15Minutes => "Last 15 minutes",
+            PredefinedSpan::Last30Minutes => "Last 30 minutes",
+            PredefinedSpan::Last1Hour => "Last 1 hour",
+            PredefinedSpan::Last6Hours => "Last 6 hours",
+            PredefinedSpan::Last24Hours => "Last 24 hours",
+            PredefinedSpan::Last3Days => "Last 3 days",
+            PredefinedSpan::Last1Week => "Last 1 week",
+            PredefinedSpan::Last1Month => "Last 1 month",
+        }
+    }
+
+    fn to_duration(&self) -> Duration {
+        match self {
+            PredefinedSpan::Last15Minutes => Duration::minutes(15),
+            PredefinedSpan::Last30Minutes => Duration::minutes(30),
+            PredefinedSpan::Last1Hour => Duration::hours(1),
+            PredefinedSpan::Last6Hours => Duration::hours(6),
+            PredefinedSpan::Last24Hours => Duration::days(1),
+            PredefinedSpan::Last3Days => Duration::days(3),
+            PredefinedSpan::Last1Week => Duration::weeks(1),
+            PredefinedSpan::Last1Month => Duration::days(30),
+        }
+    }
+}
+
+impl TimeUnit {
+    fn display_name(&self) -> &'static str {
+        match self {
+            TimeUnit::Minutes => "minutes",
+            TimeUnit::Hours => "hours",
+            TimeUnit::Days => "days",
+        }
+    }
+
+    fn to_duration(&self, amount: i64) -> Duration {
+        match self {
+            TimeUnit::Minutes => Duration::minutes(amount),
+            TimeUnit::Hours => Duration::hours(amount),
+            TimeUnit::Days => Duration::days(amount),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -57,6 +131,19 @@ struct LogsApp {
     show_favorites: bool,
     new_favorite_name: String,
     favorite_search_text: String,
+    time_span_mode: TimeSpanMode,
+    custom_from_year: i32,
+    custom_from_month: u32,
+    custom_from_day: u32,
+    custom_from_hour: u32,
+    custom_from_minute: u32,
+    custom_to_year: i32,
+    custom_to_month: u32,
+    custom_to_day: u32,
+    custom_to_hour: u32,
+    custom_to_minute: u32,
+    relative_amount: i32,
+    relative_unit: TimeUnit,
 }
 
 impl Default for LogsApp {
@@ -73,6 +160,8 @@ impl Default for LogsApp {
         selected_log_levels.insert("critical".to_string());
         selected_log_levels.insert("crit".to_string());
         
+        let now = Local::now().naive_local();
+        
         Self {
             settings: Self::load_settings(),
             logs: Vec::new(),
@@ -88,6 +177,19 @@ impl Default for LogsApp {
             show_favorites: false,
             new_favorite_name: String::new(),
             favorite_search_text: String::new(),
+            time_span_mode: TimeSpanMode::Disabled,
+            custom_from_year: now.year(),
+            custom_from_month: now.month(),
+            custom_from_day: now.day(),
+            custom_from_hour: 0,
+            custom_from_minute: 0,
+            custom_to_year: now.year(),
+            custom_to_month: now.month(),
+            custom_to_day: now.day(),
+            custom_to_hour: 23,
+            custom_to_minute: 59,
+            relative_amount: 1,
+            relative_unit: TimeUnit::Hours,
         }
     }
 }
@@ -134,6 +236,77 @@ impl LogsApp {
     fn apply_favorite_command(&mut self, command: String) {
         self.settings.log_command = command;
         self.restart_log_collection();
+    }
+
+    fn get_time_range(&self) -> Option<(NaiveDateTime, NaiveDateTime)> {
+        match &self.time_span_mode {
+            TimeSpanMode::Disabled => None,
+            TimeSpanMode::Predefined(span) => {
+                let now = Local::now().naive_local();
+                let duration = span.to_duration();
+                let from = now - duration;
+                Some((from, now))
+            },
+            TimeSpanMode::Custom => {
+                let from = NaiveDate::from_ymd_opt(
+                    self.custom_from_year,
+                    self.custom_from_month,
+                    self.custom_from_day,
+                )?.and_time(NaiveTime::from_hms_opt(
+                    self.custom_from_hour,
+                    self.custom_from_minute,
+                    0,
+                )?);
+                
+                let to = NaiveDate::from_ymd_opt(
+                    self.custom_to_year,
+                    self.custom_to_month,
+                    self.custom_to_day,
+                )?.and_time(NaiveTime::from_hms_opt(
+                    self.custom_to_hour,
+                    self.custom_to_minute,
+                    59,
+                )?);
+                
+                Some((from, to))
+            },
+            TimeSpanMode::Relative => {
+                let now = Local::now().naive_local();
+                let duration = self.relative_unit.to_duration(self.relative_amount as i64);
+                let from = now - duration;
+                Some((from, now))
+            },
+        }
+    }
+
+    fn parse_time_input(input: &str) -> Option<NaiveDateTime> {
+        if input.trim().is_empty() {
+            return None;
+        }
+
+        let trimmed = input.trim();
+        
+        // Try full format first: "2025-09-15 12:23:30"
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+            return Some(dt);
+        }
+        
+        // Try date + hour:minute: "2025-09-15 12:23"
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M") {
+            return Some(dt);
+        }
+        
+        // Try date + hour: "2025-09-15 12"
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H") {
+            return Some(dt);
+        }
+        
+        // Try just date: "2025-09-15"
+        if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+            return Some(date.and_time(NaiveTime::from_hms_opt(0, 0, 0)?));
+        }
+        
+        None
     }
 
     fn start_log_collection(&mut self) {
@@ -238,7 +411,19 @@ impl LogsApp {
                             .contains(&self.search_text.to_lowercase())
                 };
 
-                matches_filter && matches_search
+                let matches_time = if let Some((from_time, to_time)) = self.get_time_range() {
+                    let entry_time = Self::parse_time_input(&entry.timestamp);
+                    
+                    if let Some(entry_dt) = entry_time {
+                        entry_dt >= from_time && entry_dt <= to_time
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+
+                matches_filter && matches_search && matches_time
             })
             .collect()
     }
@@ -331,6 +516,71 @@ impl eframe::App for LogsApp {
 
                 ui.label("Search:");
                 ui.text_edit_singleline(&mut self.search_text);
+
+                ui.separator();
+
+                ui.label("Time Filter:");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("Time Span")
+                        .selected_text(match &self.time_span_mode {
+                            TimeSpanMode::Disabled => "Disabled",
+                            TimeSpanMode::Predefined(span) => span.display_name(),
+                            TimeSpanMode::Custom => "Custom Range",
+                            TimeSpanMode::Relative => "Relative Time",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Disabled, "Disabled");
+                            ui.separator();
+                            
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last15Minutes), "Last 15 minutes");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last30Minutes), "Last 30 minutes");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last1Hour), "Last 1 hour");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last6Hours), "Last 6 hours");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last24Hours), "Last 24 hours");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last3Days), "Last 3 days");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last1Week), "Last 1 week");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last1Month), "Last 1 month");
+                            ui.separator();
+                            
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Custom, "Custom Range");
+                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Relative, "Relative Time");
+                        });
+                });
+
+                match &self.time_span_mode {
+                    TimeSpanMode::Custom => {
+                        ui.horizontal(|ui| {
+                            ui.label("From:");
+                            ui.add(egui::DragValue::new(&mut self.custom_from_year).range(2000..=2100).prefix("Year: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_from_month).range(1..=12).prefix("Month: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_from_day).range(1..=31).prefix("Day: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_from_hour).range(0..=23).prefix("Hour: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_from_minute).range(0..=59).prefix("Min: "));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("To:");
+                            ui.add(egui::DragValue::new(&mut self.custom_to_year).range(2000..=2100).prefix("Year: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_to_month).range(1..=12).prefix("Month: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_to_day).range(1..=31).prefix("Day: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_to_hour).range(0..=23).prefix("Hour: "));
+                            ui.add(egui::DragValue::new(&mut self.custom_to_minute).range(0..=59).prefix("Min: "));
+                        });
+                    },
+                    TimeSpanMode::Relative => {
+                        ui.horizontal(|ui| {
+                            ui.label("Last");
+                            ui.add(egui::DragValue::new(&mut self.relative_amount).range(1..=999));
+                            egui::ComboBox::from_label("")
+                                .selected_text(self.relative_unit.display_name())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.relative_unit, TimeUnit::Minutes, "minutes");
+                                    ui.selectable_value(&mut self.relative_unit, TimeUnit::Hours, "hours");
+                                    ui.selectable_value(&mut self.relative_unit, TimeUnit::Days, "days");
+                                });
+                        });
+                    },
+                    _ => {}
+                }
 
                 ui.separator();
 
