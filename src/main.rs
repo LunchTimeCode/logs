@@ -1,14 +1,14 @@
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader};
-use std::fs;
-use std::path::PathBuf;
-use chrono::{NaiveDateTime, NaiveDate, NaiveTime, Duration, Local, Datelike};
-use regex::Regex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FavoriteCommand {
@@ -164,10 +164,10 @@ impl Default for LogsApp {
         selected_log_levels.insert("fatal".to_string());
         selected_log_levels.insert("critical".to_string());
         selected_log_levels.insert("crit".to_string());
-        
+
         let now = Local::now().naive_local();
-        
-        Self {
+
+        let mut app = Self {
             settings: Self::load_settings(),
             logs: Vec::new(),
             selected_log_levels,
@@ -199,7 +199,11 @@ impl Default for LogsApp {
             relative_amount: 1,
             relative_unit: TimeUnit::Hours,
             is_loading: false,
-        }
+        };
+
+        // Always start log collection immediately
+        app.start_log_collection();
+        app
     }
 }
 
@@ -231,7 +235,9 @@ impl LogsApp {
     }
 
     fn add_favorite_command(&mut self, name: String, command: String) {
-        self.settings.favorite_commands.push(FavoriteCommand { name, command });
+        self.settings
+            .favorite_commands
+            .push(FavoriteCommand { name, command });
         self.save_settings();
     }
 
@@ -263,36 +269,38 @@ impl LogsApp {
                 let duration = span.to_duration();
                 let from = now - duration;
                 Some((from, now))
-            },
+            }
             TimeSpanMode::Custom => {
                 let from = NaiveDate::from_ymd_opt(
                     self.custom_from_year,
                     self.custom_from_month,
                     self.custom_from_day,
-                )?.and_time(NaiveTime::from_hms_opt(
+                )?
+                .and_time(NaiveTime::from_hms_opt(
                     self.custom_from_hour,
                     self.custom_from_minute,
                     0,
                 )?);
-                
+
                 let to = NaiveDate::from_ymd_opt(
                     self.custom_to_year,
                     self.custom_to_month,
                     self.custom_to_day,
-                )?.and_time(NaiveTime::from_hms_opt(
+                )?
+                .and_time(NaiveTime::from_hms_opt(
                     self.custom_to_hour,
                     self.custom_to_minute,
                     59,
                 )?);
-                
+
                 Some((from, to))
-            },
+            }
             TimeSpanMode::Relative => {
                 let now = Local::now().naive_local();
                 let duration = self.relative_unit.to_duration(self.relative_amount as i64);
                 let from = now - duration;
                 Some((from, now))
-            },
+            }
         }
     }
 
@@ -302,27 +310,27 @@ impl LogsApp {
         }
 
         let trimmed = input.trim();
-        
+
         // Try full format first: "2025-09-15 12:23:30"
         if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
             return Some(dt);
         }
-        
+
         // Try date + hour:minute: "2025-09-15 12:23"
         if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M") {
             return Some(dt);
         }
-        
+
         // Try date + hour: "2025-09-15 12"
         if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H") {
             return Some(dt);
         }
-        
+
         // Try just date: "2025-09-15"
         if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
             return Some(date.and_time(NaiveTime::from_hms_opt(0, 0, 0)?));
         }
-        
+
         None
     }
 
@@ -330,19 +338,34 @@ impl LogsApp {
         // Common timestamp patterns in logs
         let patterns = [
             // ISO 8601 with milliseconds: "2025-09-15T14:30:00.123Z"
-            (r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z?)", "%Y-%m-%dT%H:%M:%S%.3fZ"),
+            (
+                r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z?)",
+                "%Y-%m-%dT%H:%M:%S%.3fZ",
+            ),
             // Standard datetime: "2025-09-15 14:30:00.123"
-            (r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d{3})?)", "%Y-%m-%d %H:%M:%S%.3f"),
+            (
+                r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d{3})?)",
+                "%Y-%m-%d %H:%M:%S%.3f",
+            ),
             // Standard datetime without milliseconds: "2025-09-15 14:30:00"
-            (r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", "%Y-%m-%d %H:%M:%S"),
+            (
+                r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+                "%Y-%m-%d %H:%M:%S",
+            ),
             // Syslog format: "Sep 15 14:30:00" or "Sep  5 14:30:00"
-            (r"([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})", "%b %d %H:%M:%S"),
+            (
+                r"([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})",
+                "%b %d %H:%M:%S",
+            ),
             // Time only with milliseconds: "14:30:00.123"
             (r"(\d{2}:\d{2}:\d{2}\.\d{3})", "%H:%M:%S%.3f"),
             // Time only: "14:30:00"
             (r"(\d{2}:\d{2}:\d{2})", "%H:%M:%S"),
             // Date with slashes: "09/15/2025 14:30:00"
-            (r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})", "%m/%d/%Y %H:%M:%S"),
+            (
+                r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})",
+                "%m/%d/%Y %H:%M:%S",
+            ),
             // Unix timestamp (10 digits): "1726401000"
             (r"(\d{10})", "unix"),
         ];
@@ -352,7 +375,7 @@ impl LogsApp {
                 if let Some(captures) = re.captures(content) {
                     if let Some(timestamp_match) = captures.get(1) {
                         let timestamp_str = timestamp_match.as_str();
-                        
+
                         // Parse the timestamp
                         let parsed_timestamp = if *format == "unix" {
                             // Handle Unix timestamp
@@ -375,7 +398,8 @@ impl LogsApp {
                         if let Some(dt) = parsed_timestamp {
                             let formatted_timestamp = dt.format("%Y-%m-%d %H:%M:%S").to_string();
                             // Remove the timestamp from content to avoid duplication
-                            let cleaned_content = content.replace(timestamp_str, "").trim().to_string();
+                            let cleaned_content =
+                                content.replace(timestamp_str, "").trim().to_string();
                             return (Some(formatted_timestamp), cleaned_content);
                         }
                     }
@@ -408,9 +432,7 @@ impl LogsApp {
             let args = &parts[1..];
 
             let mut cmd = Command::new(program);
-            cmd.args(args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
             if let Ok(mut child) = cmd.spawn() {
                 if let Some(stdout) = child.stdout.take() {
@@ -426,7 +448,7 @@ impl LogsApp {
                         }
                     }
                 }
-                
+
                 // Clean up the child process
                 let _ = child.wait();
             }
@@ -452,14 +474,13 @@ impl LogsApp {
 
     fn add_log_entry(&mut self, content: String) {
         let (extracted_timestamp, cleaned_content) = Self::extract_timestamp_from_log(&content);
-        
-        let timestamp = extracted_timestamp.unwrap_or_else(|| {
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-        });
-        
-        self.logs.push(LogEntry { 
-            timestamp, 
-            content: cleaned_content 
+
+        let timestamp = extracted_timestamp
+            .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+
+        self.logs.push(LogEntry {
+            timestamp,
+            content: cleaned_content,
         });
 
         // Set loading to false when we receive the first log entry
@@ -480,11 +501,12 @@ impl LogsApp {
                     true
                 } else {
                     let content_lower = entry.content.to_lowercase();
-                    
-                    let contains_selected_level = self.selected_log_levels.iter().any(|level| {
-                        content_lower.contains(&level.to_lowercase())
-                    });
-                    
+
+                    let contains_selected_level = self
+                        .selected_log_levels
+                        .iter()
+                        .any(|level| content_lower.contains(&level.to_lowercase()));
+
                     match self.filter_mode {
                         FilterMode::IncludeSelected => contains_selected_level,
                         FilterMode::ExcludeSelected => !contains_selected_level,
@@ -506,7 +528,7 @@ impl LogsApp {
 
                 let matches_time = if let Some((from_time, to_time)) = self.get_time_range() {
                     let entry_time = Self::parse_time_input(&entry.timestamp);
-                    
+
                     if let Some(entry_dt) = entry_time {
                         entry_dt >= from_time && entry_dt <= to_time
                     } else {
@@ -559,12 +581,15 @@ impl eframe::App for LogsApp {
                 ui.separator();
 
                 ui.label("Command:");
-                ui.add(egui::TextEdit::singleline(&mut self.settings.log_command).desired_width(200.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.log_command).desired_width(200.0),
+                );
                 if ui.button("Apply").clicked() {
                     self.restart_log_collection();
                 }
                 if ui.button("⭐").on_hover_text("Save as favorite").clicked() {
-                    self.new_favorite_name = format!("Command {}", self.settings.favorite_commands.len() + 1);
+                    self.new_favorite_name =
+                        format!("Command {}", self.settings.favorite_commands.len() + 1);
                     self.show_favorites = true;
                 }
 
@@ -578,7 +603,7 @@ impl eframe::App for LogsApp {
                             let levels = [
                                 ("All Levels", "All Levels"),
                                 ("TRACE", "trace"),
-                                ("DEBUG", "debug"), 
+                                ("DEBUG", "debug"),
                                 ("INFO", "info"),
                                 ("WARN", "warn"),
                                 ("WARNING", "warning"),
@@ -588,9 +613,16 @@ impl eframe::App for LogsApp {
                                 ("CRITICAL", "critical"),
                                 ("CRIT", "crit"),
                             ];
-                            
+
                             for (display_name, level_key) in levels {
-                                if ui.selectable_value(&mut self.current_level_filter, display_name.to_string(), display_name).clicked() {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.current_level_filter,
+                                        display_name.to_string(),
+                                        display_name,
+                                    )
+                                    .clicked()
+                                {
                                     self.selected_log_levels.clear();
                                     if level_key != "All Levels" {
                                         self.selected_log_levels.insert(level_key.to_string());
@@ -598,11 +630,19 @@ impl eframe::App for LogsApp {
                                 }
                             }
                         });
-                    
+
                     ui.separator();
                     ui.label("Mode:");
-                    ui.radio_value(&mut self.filter_mode, FilterMode::IncludeSelected, "Include");
-                    ui.radio_value(&mut self.filter_mode, FilterMode::ExcludeSelected, "Exclude");
+                    ui.radio_value(
+                        &mut self.filter_mode,
+                        FilterMode::IncludeSelected,
+                        "Include",
+                    );
+                    ui.radio_value(
+                        &mut self.filter_mode,
+                        FilterMode::ExcludeSelected,
+                        "Exclude",
+                    );
                 });
 
                 ui.separator();
@@ -622,21 +662,65 @@ impl eframe::App for LogsApp {
                             TimeSpanMode::Relative => "Relative Time",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Disabled, "Disabled");
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Disabled,
+                                "Disabled",
+                            );
                             ui.separator();
-                            
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last15Minutes), "Last 15 minutes");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last30Minutes), "Last 30 minutes");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last1Hour), "Last 1 hour");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last6Hours), "Last 6 hours");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last24Hours), "Last 24 hours");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last3Days), "Last 3 days");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last1Week), "Last 1 week");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Predefined(PredefinedSpan::Last1Month), "Last 1 month");
+
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last15Minutes),
+                                "Last 15 minutes",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last30Minutes),
+                                "Last 30 minutes",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last1Hour),
+                                "Last 1 hour",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last6Hours),
+                                "Last 6 hours",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last24Hours),
+                                "Last 24 hours",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last3Days),
+                                "Last 3 days",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last1Week),
+                                "Last 1 week",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Predefined(PredefinedSpan::Last1Month),
+                                "Last 1 month",
+                            );
                             ui.separator();
-                            
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Custom, "Custom Range");
-                            ui.selectable_value(&mut self.time_span_mode, TimeSpanMode::Relative, "Relative Time");
+
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Custom,
+                                "Custom Range",
+                            );
+                            ui.selectable_value(
+                                &mut self.time_span_mode,
+                                TimeSpanMode::Relative,
+                                "Relative Time",
+                            );
                         });
                 });
 
@@ -644,21 +728,61 @@ impl eframe::App for LogsApp {
                     TimeSpanMode::Custom => {
                         ui.horizontal(|ui| {
                             ui.label("From:");
-                            ui.add(egui::DragValue::new(&mut self.custom_from_year).range(2000..=2100).prefix("Year: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_from_month).range(1..=12).prefix("Month: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_from_day).range(1..=31).prefix("Day: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_from_hour).range(0..=23).prefix("Hour: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_from_minute).range(0..=59).prefix("Min: "));
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_from_year)
+                                    .range(2000..=2100)
+                                    .prefix("Year: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_from_month)
+                                    .range(1..=12)
+                                    .prefix("Month: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_from_day)
+                                    .range(1..=31)
+                                    .prefix("Day: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_from_hour)
+                                    .range(0..=23)
+                                    .prefix("Hour: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_from_minute)
+                                    .range(0..=59)
+                                    .prefix("Min: "),
+                            );
                         });
                         ui.horizontal(|ui| {
                             ui.label("To:");
-                            ui.add(egui::DragValue::new(&mut self.custom_to_year).range(2000..=2100).prefix("Year: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_to_month).range(1..=12).prefix("Month: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_to_day).range(1..=31).prefix("Day: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_to_hour).range(0..=23).prefix("Hour: "));
-                            ui.add(egui::DragValue::new(&mut self.custom_to_minute).range(0..=59).prefix("Min: "));
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_to_year)
+                                    .range(2000..=2100)
+                                    .prefix("Year: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_to_month)
+                                    .range(1..=12)
+                                    .prefix("Month: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_to_day)
+                                    .range(1..=31)
+                                    .prefix("Day: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_to_hour)
+                                    .range(0..=23)
+                                    .prefix("Hour: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.custom_to_minute)
+                                    .range(0..=59)
+                                    .prefix("Min: "),
+                            );
                         });
-                    },
+                    }
                     TimeSpanMode::Relative => {
                         ui.horizontal(|ui| {
                             ui.label("Last");
@@ -666,12 +790,24 @@ impl eframe::App for LogsApp {
                             egui::ComboBox::from_label("")
                                 .selected_text(self.relative_unit.display_name())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.relative_unit, TimeUnit::Minutes, "minutes");
-                                    ui.selectable_value(&mut self.relative_unit, TimeUnit::Hours, "hours");
-                                    ui.selectable_value(&mut self.relative_unit, TimeUnit::Days, "days");
+                                    ui.selectable_value(
+                                        &mut self.relative_unit,
+                                        TimeUnit::Minutes,
+                                        "minutes",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.relative_unit,
+                                        TimeUnit::Hours,
+                                        "hours",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.relative_unit,
+                                        TimeUnit::Days,
+                                        "days",
+                                    );
                                 });
                         });
-                    },
+                    }
                     _ => {}
                 }
 
@@ -732,7 +868,8 @@ impl eframe::App for LogsApp {
                     ui.horizontal(|ui| {
                         ui.label("Name:");
                         ui.text_edit_singleline(&mut self.new_favorite_name);
-                        if ui.button("Save").clicked() && !self.new_favorite_name.trim().is_empty() {
+                        if ui.button("Save").clicked() && !self.new_favorite_name.trim().is_empty()
+                        {
                             save_new_favorite = true;
                         }
                     });
@@ -751,7 +888,9 @@ impl eframe::App for LogsApp {
                     if self.settings.favorite_commands.is_empty() {
                         ui.label("No favorite commands saved yet.");
                     } else {
-                        let filtered_favorites: Vec<(usize, &FavoriteCommand)> = self.settings.favorite_commands
+                        let filtered_favorites: Vec<(usize, &FavoriteCommand)> = self
+                            .settings
+                            .favorite_commands
                             .iter()
                             .enumerate()
                             .filter(|(_, favorite)| {
@@ -759,8 +898,8 @@ impl eframe::App for LogsApp {
                                     true
                                 } else {
                                     let search_lower = self.favorite_search_text.to_lowercase();
-                                    favorite.name.to_lowercase().contains(&search_lower) ||
-                                    favorite.command.to_lowercase().contains(&search_lower)
+                                    favorite.name.to_lowercase().contains(&search_lower)
+                                        || favorite.command.to_lowercase().contains(&search_lower)
                                 }
                             })
                             .collect();
@@ -774,16 +913,20 @@ impl eframe::App for LogsApp {
                                         if ui.button("Use").clicked() {
                                             favorite_to_apply = Some(favorite.command.clone());
                                         }
-                                        
+
                                         // Check if this item is being edited
                                         if let Some(edit_index) = self.editing_favorite_index {
                                             if edit_index == index {
                                                 // Show editable fields
                                                 ui.label("Name:");
-                                                ui.text_edit_singleline(&mut self.edit_favorite_name);
+                                                ui.text_edit_singleline(
+                                                    &mut self.edit_favorite_name,
+                                                );
                                                 ui.label("Command:");
-                                                ui.text_edit_singleline(&mut self.edit_favorite_command);
-                                                
+                                                ui.text_edit_singleline(
+                                                    &mut self.edit_favorite_command,
+                                                );
+
                                                 if ui.button("Save").clicked() {
                                                     save_edit = Some(index);
                                                 }
@@ -800,12 +943,18 @@ impl eframe::App for LogsApp {
                                             // Show read-only with edit button
                                             ui.label(&favorite.name);
                                             ui.label(&favorite.command);
-                                            
+
                                             if ui.button("📝").on_hover_text("Edit").clicked() {
                                                 start_edit = Some(index);
                                             }
-                                            if ui.button("📋").on_hover_text("Copy command").clicked() {
-                                                ui.output_mut(|o| o.copied_text = favorite.command.clone());
+                                            if ui
+                                                .button("📋")
+                                                .on_hover_text("Copy command")
+                                                .clicked()
+                                            {
+                                                ui.output_mut(|o| {
+                                                    o.copied_text = favorite.command.clone()
+                                                });
                                             }
                                             if ui.button("🗑").on_hover_text("Delete").clicked() {
                                                 favorite_to_remove = Some(index);
@@ -842,12 +991,15 @@ impl eframe::App for LogsApp {
                 if index < self.settings.favorite_commands.len() {
                     self.editing_favorite_index = Some(index);
                     self.edit_favorite_name = self.settings.favorite_commands[index].name.clone();
-                    self.edit_favorite_command = self.settings.favorite_commands[index].command.clone();
+                    self.edit_favorite_command =
+                        self.settings.favorite_commands[index].command.clone();
                 }
             }
 
             if let Some(index) = save_edit {
-                if !self.edit_favorite_name.trim().is_empty() && !self.edit_favorite_command.trim().is_empty() {
+                if !self.edit_favorite_name.trim().is_empty()
+                    && !self.edit_favorite_command.trim().is_empty()
+                {
                     self.update_favorite_command(
                         index,
                         self.edit_favorite_name.trim().to_string(),
@@ -888,43 +1040,51 @@ impl eframe::App for LogsApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.is_loading {
                 // Show loading spinner when waiting for command output
-                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::TopDown), |ui| {
-                    ui.add_space(50.0);
-                    
-                    // Create a spinning loading icon
-                    let time = ui.input(|i| i.time);
-                    let spinner_angle = time as f32 * 2.0; // Rotate 2 radians per second
-                    
-                    let (rect, _response) = ui.allocate_exact_size(egui::Vec2::splat(40.0), egui::Sense::hover());
-                    
-                    if ui.is_rect_visible(rect) {
-                        let painter = ui.painter();
-                        let center = rect.center();
-                        let radius = 15.0;
-                        let stroke_width = 3.0;
-                        
-                        // Draw spinning arc
-                        for i in 0..8 {
-                            let angle = spinner_angle + (i as f32 * std::f32::consts::PI / 4.0);
-                            let alpha = (1.0 - (i as f32 / 8.0)) * 0.8 + 0.2;
-                            let color = egui::Color32::from_rgba_premultiplied(
-                                (255.0 * alpha) as u8,
-                                (255.0 * alpha) as u8,
-                                (255.0 * alpha) as u8,
-                                255
-                            );
-                            
-                            let start = center + egui::Vec2::angled(angle) * (radius - stroke_width);
-                            let end = center + egui::Vec2::angled(angle) * radius;
-                            
-                            painter.line_segment([start, end], egui::Stroke::new(stroke_width, color));
+                ui.with_layout(
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.add_space(50.0);
+
+                        // Create a spinning loading icon
+                        let time = ui.input(|i| i.time);
+                        let spinner_angle = time as f32 * 2.0; // Rotate 2 radians per second
+
+                        let (rect, _response) =
+                            ui.allocate_exact_size(egui::Vec2::splat(40.0), egui::Sense::hover());
+
+                        if ui.is_rect_visible(rect) {
+                            let painter = ui.painter();
+                            let center = rect.center();
+                            let radius = 15.0;
+                            let stroke_width = 3.0;
+
+                            // Draw spinning arc
+                            for i in 0..8 {
+                                let angle = spinner_angle + (i as f32 * std::f32::consts::PI / 4.0);
+                                let alpha = (1.0 - (i as f32 / 8.0)) * 0.8 + 0.2;
+                                let color = egui::Color32::from_rgba_premultiplied(
+                                    (255.0 * alpha) as u8,
+                                    (255.0 * alpha) as u8,
+                                    (255.0 * alpha) as u8,
+                                    255,
+                                );
+
+                                let start =
+                                    center + egui::Vec2::angled(angle) * (radius - stroke_width);
+                                let end = center + egui::Vec2::angled(angle) * radius;
+
+                                painter.line_segment(
+                                    [start, end],
+                                    egui::Stroke::new(stroke_width, color),
+                                );
+                            }
                         }
-                    }
-                    
-                    ui.add_space(20.0);
-                    ui.label("Loading logs...");
-                    ui.label(format!("Running: {}", self.settings.log_command));
-                });
+
+                        ui.add_space(20.0);
+                        ui.label("Loading logs...");
+                        ui.label(format!("Running: {}", self.settings.log_command));
+                    },
+                );
             } else {
                 // Show normal log display
                 let filtered_logs = self.filtered_logs();
@@ -941,20 +1101,29 @@ impl eframe::App for LogsApp {
                                 ui.strong("Timestamp");
                                 ui.strong("Log Content");
                                 ui.end_row();
-                                
+
                                 // Add separator line
                                 ui.separator();
                                 ui.separator();
                                 ui.end_row();
-                                
+
                                 // Log entries
                                 for log_entry in filtered_logs {
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                        ui.add_sized([180.0, ui.available_height()], egui::Label::new(&log_entry.timestamp));
-                                    });
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                        ui.label(&log_entry.content);
-                                    });
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::TOP),
+                                        |ui| {
+                                            ui.add_sized(
+                                                [180.0, ui.available_height()],
+                                                egui::Label::new(&log_entry.timestamp),
+                                            );
+                                        },
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::TOP),
+                                        |ui| {
+                                            ui.label(&log_entry.content);
+                                        },
+                                    );
                                     ui.end_row();
                                 }
                             });
@@ -972,8 +1141,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
-    let mut app = LogsApp::default();
-    app.start_log_collection();
+    let app = LogsApp::default();
 
     eframe::run_native("Logs Viewer", options, Box::new(|_cc| Ok(Box::new(app))))
 }
