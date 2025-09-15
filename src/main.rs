@@ -56,6 +56,7 @@ struct LogsApp {
     current_level_filter: String,
     show_favorites: bool,
     new_favorite_name: String,
+    favorite_search_text: String,
 }
 
 impl Default for LogsApp {
@@ -86,6 +87,7 @@ impl Default for LogsApp {
             current_level_filter: "All Levels".to_string(),
             show_favorites: false,
             new_favorite_name: String::new(),
+            favorite_search_text: String::new(),
         }
     }
 }
@@ -392,23 +394,49 @@ impl eframe::App for LogsApp {
                     ui.separator();
                     ui.heading("Favorite Commands");
 
+                    ui.horizontal(|ui| {
+                        ui.label("Search:");
+                        ui.text_edit_singleline(&mut self.favorite_search_text);
+                        if ui.button("Clear").clicked() {
+                            self.favorite_search_text.clear();
+                        }
+                    });
+
                     if self.settings.favorite_commands.is_empty() {
                         ui.label("No favorite commands saved yet.");
                     } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for (index, favorite) in self.settings.favorite_commands.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Use").clicked() {
-                                        favorite_to_apply = Some(favorite.command.clone());
-                                    }
-                                    ui.label(&favorite.name);
-                                    ui.label(&favorite.command);
-                                    if ui.button("🗑").on_hover_text("Delete").clicked() {
-                                        favorite_to_remove = Some(index);
-                                    }
-                                });
-                            }
-                        });
+                        let filtered_favorites: Vec<(usize, &FavoriteCommand)> = self.settings.favorite_commands
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, favorite)| {
+                                if self.favorite_search_text.is_empty() {
+                                    true
+                                } else {
+                                    let search_lower = self.favorite_search_text.to_lowercase();
+                                    favorite.name.to_lowercase().contains(&search_lower) ||
+                                    favorite.command.to_lowercase().contains(&search_lower)
+                                }
+                            })
+                            .collect();
+
+                        if filtered_favorites.is_empty() {
+                            ui.label("No matching favorite commands found.");
+                        } else {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for (index, favorite) in filtered_favorites {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Use").clicked() {
+                                            favorite_to_apply = Some(favorite.command.clone());
+                                        }
+                                        ui.label(&favorite.name);
+                                        ui.label(&favorite.command);
+                                        if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                            favorite_to_remove = Some(index);
+                                        }
+                                    });
+                                }
+                            });
+                        }
                     }
                 });
 
