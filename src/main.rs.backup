@@ -317,58 +317,6 @@ impl eframe::App for LogsApp {
                                     }
                                 }
                             }
-                        });
-                    
-                    ui.separator();
-                    ui.label("Mode:");
-                    ui.radio_value(&mut self.filter_mode, FilterMode::IncludeSelected, "Include");
-                    ui.radio_value(&mut self.filter_mode, FilterMode::ExcludeSelected, "Exclude");
-                });
-
-                ui.separator();
-
-                ui.label("Search:");
-                ui.text_edit_singleline(&mut self.search_text);
-
-                ui.separator();
-
-                ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("Logs: {}", self.logs.len()));
-                });
-            });
-        });
-
-        let mut show_settings = self.show_settings;
-        let mut show_favorites = self.show_favorites;
-        let mut apply_settings = false;
-        let mut reset_settings = false;
-
-        if show_settings {
-            egui::Window::new("Settings")
-                .open(&mut show_settings)
-                .show(ctx, |ui| {
-                    ui.label("Refresh Interval (ms):");
-                    if ui
-                        .add(egui::Slider::new(
-                            &mut self.settings.refresh_interval,
-                            100..=5000,
-                        ))
-                        .changed()
-                    {
-                        self.settings_changed = true;
-                    }
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply").clicked() && self.settings_changed {
-                            apply_settings = true;
-                        }
-
-                        if ui.button("Reset to Default").clicked() {
-                            reset_settings = true;
-                        }
-                    });
                 });
         }
 
@@ -428,6 +376,59 @@ impl eframe::App for LogsApp {
                 show_favorites = false;
             }
         }
+                    
+                    ui.separator();
+                    ui.label("Mode:");
+                    ui.radio_value(&mut self.filter_mode, FilterMode::IncludeSelected, "Include");
+                    ui.radio_value(&mut self.filter_mode, FilterMode::ExcludeSelected, "Exclude");
+                });
+
+                ui.separator();
+
+                ui.label("Search:");
+                ui.text_edit_singleline(&mut self.search_text);
+
+                ui.separator();
+
+                ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("Logs: {}", self.logs.len()));
+                });
+            });
+        });
+
+        let mut show_settings = self.show_settings;
+        let mut show_favorites = self.show_favorites;
+        let mut apply_settings = false;
+        let mut reset_settings = false;
+
+        if show_settings {
+            egui::Window::new("Settings")
+                .open(&mut show_settings)
+                .show(ctx, |ui| {
+                    ui.label("Refresh Interval (ms):");
+                    if ui
+                        .add(egui::Slider::new(
+                            &mut self.settings.refresh_interval,
+                            100..=5000,
+                        ))
+                        .changed()
+                    {
+                        self.settings_changed = true;
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() && self.settings_changed {
+                            apply_settings = true;
+                        }
+
+                        if ui.button("Reset to Default").clicked() {
+                            reset_settings = true;
+                        }
+                    });
+                });
+        }
 
         self.show_settings = show_settings;
         self.show_favorites = show_favorites;
@@ -441,6 +442,63 @@ impl eframe::App for LogsApp {
             self.settings = Settings::default();
             self.restart_log_collection();
             self.settings_changed = false;
+        }
+
+        if show_favorites {
+            let mut save_new_favorite = false;
+            let mut favorite_to_remove: Option<usize> = None;
+            let mut favorite_to_apply: Option<String> = None;
+
+            egui::Window::new("Favorite Commands")
+                .open(&mut show_favorites)
+                .show(ctx, |ui| {
+                    ui.heading("Save Current Command");
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut self.new_favorite_name);
+                        if ui.button("Save").clicked() && !self.new_favorite_name.trim().is_empty() {
+                            save_new_favorite = true;
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("Favorite Commands");
+
+                    if self.settings.favorite_commands.is_empty() {
+                        ui.label("No favorite commands saved yet.");
+                    } else {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for (index, favorite) in self.settings.favorite_commands.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Use").clicked() {
+                                        favorite_to_apply = Some(favorite.command.clone());
+                                    }
+                                    ui.label(&favorite.name);
+                                    ui.label(&favorite.command);
+                                    if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                        favorite_to_remove = Some(index);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+
+            if save_new_favorite {
+                let name = self.new_favorite_name.trim().to_string();
+                let command = self.settings.log_command.clone();
+                self.add_favorite_command(name, command);
+                self.new_favorite_name.clear();
+            }
+
+            if let Some(index) = favorite_to_remove {
+                self.remove_favorite_command(index);
+            }
+
+            if let Some(command) = favorite_to_apply {
+                self.apply_favorite_command(command);
+                show_favorites = false;
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
