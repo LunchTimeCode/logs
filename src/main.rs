@@ -132,6 +132,9 @@ struct LogsApp {
     show_favorites: bool,
     new_favorite_name: String,
     favorite_search_text: String,
+    editing_favorite_index: Option<usize>,
+    edit_favorite_name: String,
+    edit_favorite_command: String,
     time_span_mode: TimeSpanMode,
     custom_from_year: i32,
     custom_from_month: u32,
@@ -145,6 +148,7 @@ struct LogsApp {
     custom_to_minute: u32,
     relative_amount: i32,
     relative_unit: TimeUnit,
+    is_loading: bool,
 }
 
 impl Default for LogsApp {
@@ -178,6 +182,9 @@ impl Default for LogsApp {
             show_favorites: false,
             new_favorite_name: String::new(),
             favorite_search_text: String::new(),
+            editing_favorite_index: None,
+            edit_favorite_name: String::new(),
+            edit_favorite_command: String::new(),
             time_span_mode: TimeSpanMode::Disabled,
             custom_from_year: now.year(),
             custom_from_month: now.month(),
@@ -191,6 +198,7 @@ impl Default for LogsApp {
             custom_to_minute: 59,
             relative_amount: 1,
             relative_unit: TimeUnit::Hours,
+            is_loading: false,
         }
     }
 }
@@ -230,6 +238,14 @@ impl LogsApp {
     fn remove_favorite_command(&mut self, index: usize) {
         if index < self.settings.favorite_commands.len() {
             self.settings.favorite_commands.remove(index);
+            self.save_settings();
+        }
+    }
+
+    fn update_favorite_command(&mut self, index: usize, name: String, command: String) {
+        if index < self.settings.favorite_commands.len() {
+            self.settings.favorite_commands[index].name = name;
+            self.settings.favorite_commands[index].command = command;
             self.save_settings();
         }
     }
@@ -378,6 +394,7 @@ impl LogsApp {
 
         let (tx, rx) = mpsc::channel();
         self.log_receiver = Some(rx);
+        self.is_loading = true;
 
         let command = self.settings.log_command.clone();
 
@@ -429,6 +446,7 @@ impl LogsApp {
     fn restart_log_collection(&mut self) {
         self.stop_log_collection();
         self.logs.clear();
+        self.is_loading = false;
         self.start_log_collection();
     }
 
@@ -443,6 +461,11 @@ impl LogsApp {
             timestamp, 
             content: cleaned_content 
         });
+
+        // Set loading to false when we receive the first log entry
+        if self.is_loading {
+            self.is_loading = false;
+        }
 
         if self.logs.len() > 10000 {
             self.logs.drain(0..1000);
@@ -698,6 +721,9 @@ impl eframe::App for LogsApp {
             let mut save_new_favorite = false;
             let mut favorite_to_remove: Option<usize> = None;
             let mut favorite_to_apply: Option<String> = None;
+            let mut save_edit: Option<usize> = None;
+            let mut cancel_edit = false;
+            let mut start_edit: Option<usize> = None;
 
             egui::Window::new("Favorite Commands")
                 .open(&mut show_favorites)
@@ -748,10 +774,42 @@ impl eframe::App for LogsApp {
                                         if ui.button("Use").clicked() {
                                             favorite_to_apply = Some(favorite.command.clone());
                                         }
-                                        ui.label(&favorite.name);
-                                        ui.label(&favorite.command);
-                                        if ui.button("🗑").on_hover_text("Delete").clicked() {
-                                            favorite_to_remove = Some(index);
+                                        
+                                        // Check if this item is being edited
+                                        if let Some(edit_index) = self.editing_favorite_index {
+                                            if edit_index == index {
+                                                // Show editable fields
+                                                ui.label("Name:");
+                                                ui.text_edit_singleline(&mut self.edit_favorite_name);
+                                                ui.label("Command:");
+                                                ui.text_edit_singleline(&mut self.edit_favorite_command);
+                                                
+                                                if ui.button("Save").clicked() {
+                                                    save_edit = Some(index);
+                                                }
+                                                if ui.button("Cancel").clicked() {
+                                                    cancel_edit = true;
+                                                }
+                                            } else {
+                                                // Show read-only for other items
+                                                ui.label(&favorite.name);
+                                                ui.label(&favorite.command);
+                                                ui.label("(editing another item)");
+                                            }
+                                        } else {
+                                            // Show read-only with edit button
+                                            ui.label(&favorite.name);
+                                            ui.label(&favorite.command);
+                                            
+                                            if ui.button("📝").on_hover_text("Edit").clicked() {
+                                                start_edit = Some(index);
+                                            }
+                                            if ui.button("📋").on_hover_text("Copy command").clicked() {
+                                                ui.output_mut(|o| o.copied_text = favorite.command.clone());
+                                            }
+                                            if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                                favorite_to_remove = Some(index);
+                                            }
                                         }
                                     });
                                 }
@@ -769,6 +827,42 @@ impl eframe::App for LogsApp {
 
             if let Some(index) = favorite_to_remove {
                 self.remove_favorite_command(index);
+                // Cancel editing if we're deleting the item being edited
+                if let Some(edit_index) = self.editing_favorite_index {
+                    if edit_index == index {
+                        self.editing_favorite_index = None;
+                    } else if edit_index > index {
+                        // Adjust the editing index if an item before it was deleted
+                        self.editing_favorite_index = Some(edit_index - 1);
+                    }
+                }
+            }
+
+            if let Some(index) = start_edit {
+                if index < self.settings.favorite_commands.len() {
+                    self.editing_favorite_index = Some(index);
+                    self.edit_favorite_name = self.settings.favorite_commands[index].name.clone();
+                    self.edit_favorite_command = self.settings.favorite_commands[index].command.clone();
+                }
+            }
+
+            if let Some(index) = save_edit {
+                if !self.edit_favorite_name.trim().is_empty() && !self.edit_favorite_command.trim().is_empty() {
+                    self.update_favorite_command(
+                        index,
+                        self.edit_favorite_name.trim().to_string(),
+                        self.edit_favorite_command.trim().to_string(),
+                    );
+                    self.editing_favorite_index = None;
+                    self.edit_favorite_name.clear();
+                    self.edit_favorite_command.clear();
+                }
+            }
+
+            if cancel_edit {
+                self.editing_favorite_index = None;
+                self.edit_favorite_name.clear();
+                self.edit_favorite_command.clear();
             }
 
             if let Some(command) = favorite_to_apply {
@@ -792,38 +886,80 @@ impl eframe::App for LogsApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let filtered_logs = self.filtered_logs();
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(self.auto_scroll)
-                .show(ui, |ui| {
-                    egui::Grid::new("log_grid")
-                        .striped(true)
-                        .spacing([10.0, 4.0])
-                        .show(ui, |ui| {
-                            // Table headers
-                            ui.strong("Timestamp");
-                            ui.strong("Log Content");
-                            ui.end_row();
+            if self.is_loading {
+                // Show loading spinner when waiting for command output
+                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::TopDown), |ui| {
+                    ui.add_space(50.0);
+                    
+                    // Create a spinning loading icon
+                    let time = ui.input(|i| i.time);
+                    let spinner_angle = time as f32 * 2.0; // Rotate 2 radians per second
+                    
+                    let (rect, _response) = ui.allocate_exact_size(egui::Vec2::splat(40.0), egui::Sense::hover());
+                    
+                    if ui.is_rect_visible(rect) {
+                        let painter = ui.painter();
+                        let center = rect.center();
+                        let radius = 15.0;
+                        let stroke_width = 3.0;
+                        
+                        // Draw spinning arc
+                        for i in 0..8 {
+                            let angle = spinner_angle + (i as f32 * std::f32::consts::PI / 4.0);
+                            let alpha = (1.0 - (i as f32 / 8.0)) * 0.8 + 0.2;
+                            let color = egui::Color32::from_rgba_premultiplied(
+                                (255.0 * alpha) as u8,
+                                (255.0 * alpha) as u8,
+                                (255.0 * alpha) as u8,
+                                255
+                            );
                             
-                            // Add separator line
-                            ui.separator();
-                            ui.separator();
-                            ui.end_row();
+                            let start = center + egui::Vec2::angled(angle) * (radius - stroke_width);
+                            let end = center + egui::Vec2::angled(angle) * radius;
                             
-                            // Log entries
-                            for log_entry in filtered_logs {
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                    ui.add_sized([180.0, ui.available_height()], egui::Label::new(&log_entry.timestamp));
-                                });
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                    ui.label(&log_entry.content);
-                                });
-                                ui.end_row();
-                            }
-                        });
+                            painter.line_segment([start, end], egui::Stroke::new(stroke_width, color));
+                        }
+                    }
+                    
+                    ui.add_space(20.0);
+                    ui.label("Loading logs...");
+                    ui.label(format!("Running: {}", self.settings.log_command));
                 });
+            } else {
+                // Show normal log display
+                let filtered_logs = self.filtered_logs();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(self.auto_scroll)
+                    .show(ui, |ui| {
+                        egui::Grid::new("log_grid")
+                            .striped(true)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                // Table headers
+                                ui.strong("Timestamp");
+                                ui.strong("Log Content");
+                                ui.end_row();
+                                
+                                // Add separator line
+                                ui.separator();
+                                ui.separator();
+                                ui.end_row();
+                                
+                                // Log entries
+                                for log_entry in filtered_logs {
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                        ui.add_sized([180.0, ui.available_height()], egui::Label::new(&log_entry.timestamp));
+                                    });
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                        ui.label(&log_entry.content);
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
         });
     }
 }
